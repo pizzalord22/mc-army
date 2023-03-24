@@ -1,169 +1,177 @@
 package main
 
 import (
-	"github.com/Tnze/go-mc/bot/path"
-	"github.com/mattn/go-colorable"
-	"log"
-	"math"
-	"time"
+    "context"
+    "fmt"
+    "github.com/Tnze/go-mc/net"
+    "github.com/mattn/go-colorable"
+    GMMAuth "github.com/maxsupermanhd/go-mc-ms-auth"
+    "log"
+    "time"
 
-	"github.com/google/uuid"
-
-	"github.com/Tnze/go-mc/bot"
-	"github.com/Tnze/go-mc/chat"
-	_ "github.com/Tnze/go-mc/data/lang/en-us"
+    "github.com/Tnze/go-mc/bot"
+    "github.com/Tnze/go-mc/bot/basic"
+    "github.com/Tnze/go-mc/bot/msg"
+    "github.com/Tnze/go-mc/bot/playerlist"
+    "github.com/Tnze/go-mc/chat"
+    _ "github.com/Tnze/go-mc/data/lang/en-us"
+    "github.com/Tnze/go-mc/data/packetid"
+    pk "github.com/Tnze/go-mc/net/packet"
 )
 
-//const timeout = 45
-
-// wood types
-const (
-	treeStart = 109
-	treeEnd   = 123
-)
-
-// const block id
-const (
-	air   = 0
-	water = 34
-)
+const timeout = 45
 
 var (
-	c           *bot.Client
-	watch       chan time.Time
-	destination bot.Position
+    c *bot.Client
+    p *basic.Player
+
+    playerList  *playerlist.PlayerList
+    chatHandler *msg.Manager
+
+    watch chan time.Time
 )
 
-// todo make a struct that contains bot data
-// make the different actions queryable with a channel
 func main() {
-	w := ParseWorld(`
-.....~......
-.....MM.....
-.F........T.
-....MMM.....
-............`,
-	)
-	Astar(w)
-	return
-	log.SetOutput(colorable.NewColorableStdout())
-	c = bot.NewClient()
-	c.Name = "bot1"
-	//Login
-	err := c.JoinServer("localhost", 25565)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Login success")
+    mauth, err := GMMAuth.GetMCcredentials("./auth.cache", "88650e7e-efee-4857-b9a9-cf580a00ef43")
+    if err != nil {
+        log.Print(err)
+        return
+    }
+    //log.Print("Authenticated as ", mauth.Name, " (", mauth.UUID, ")")
+    c = bot.NewClient()
+    c.Auth = mauth
+    log.SetOutput(colorable.NewColorableStdout()) // optional for colorable output
 
-	//Register event handlers
-	c.Events.GameStart = onGameStart
-	c.Events.ChatMsg = onChatMsg
-	c.Events.Disconnect = onDisconnect
-	c.Events.SoundPlay = onSound
-	c.Events.Die = onDeath
-	c.Events.PositionChange = onMove
+    p = basic.NewPlayer(c, basic.DefaultSettings, basic.EventsListener{
+        GameStart:  onGameStart,
+        Disconnect: onDisconnect,
+        Death:      onDeath,
+    })
 
-	//JoinGame
-	err = c.HandleGame()
-	if err != nil {
-		log.Fatal(err)
-	}
+    playerList = playerlist.New(c)
+    chatHandler = msg.New(c, p, playerList, msg.EventsHandler{
+        SystemChat:        onSystemChat,
+        PlayerChatMessage: onPlayerChat,
+        DisguisedChat:     onDisguisedChat,
+    })
+
+    // Register event handlers
+
+    //c.Events.AddListener(soundListener)
+
+    // Login
+    //err := c.JoinServer("193.31.31.162:25513")
+    for {
+        playerList = playerlist.New(c)
+        for _, player := range playerList.PlayerInfos {
+            fmt.Println(player.Name)
+        }
+        err = c.JoinServerWithOptions("193.31.31.162:25513", bot.JoinOptions{
+            MCDialer:    &net.DefaultDialer,
+            Context:     context.Background(),
+            NoPublicKey: false,
+            KeyPair:     nil,
+        })
+        if err != nil {
+            log.Fatal(err)
+        }
+        log.Println("Login success")
+
+        // JoinGame
+        err = c.HandleGame()
+        if err != nil {
+            log.Println(err)
+        }
+    }
 }
 
 func onDeath() error {
-	log.Println("Died and Respawned")
-	time.Sleep(1 * time.Second)
-	c.Respawn() // If we exclude Respawn(...) then the player won't press the "Respawn" button upon death
-	return nil
+    log.Println("Died and Respawned")
+    // If we exclude Respawn(...) then the player won't press the "Respawn" button upon death
+    return p.Respawn()
 }
 
 func onGameStart() error {
-	log.Println("Game start")
+    log.Println("Game start")
 
-	watch = make(chan time.Time)
-	go watchDog()
+    //watch = make(chan time.Time)
+    //go watchDog()
 
-	return c.UseItem(0)
+    //return UseItem(0)
+    return nil
 }
 
-func onSound(name string, category int, x, y, z float64, volume, pitch float32) error {
-	if name == "entity.fishing_bobber.splash" {
-		if err := c.UseItem(0); err != nil { //retrieve
-			return err
-		}
-		log.Println("gra~")
-		time.Sleep(time.Millisecond * 300)
-		if err := c.UseItem(0); err != nil { //throw
-			return err
-		}
-		watch <- time.Now()
-	}
-	return nil
+var soundListener = bot.PacketHandler{
+    ID:       packetid.ClientboundSound,
+    Priority: 0,
+    F: func(p pk.Packet) error {
+        var (
+            SoundID       pk.VarInt
+            SoundCategory pk.VarInt
+            X, Y, Z       pk.Int
+            Volume, Pitch pk.Float
+        )
+        if err := p.Scan(&SoundID, &SoundCategory, &X, &Y, &Z, &Volume, &Pitch); err != nil {
+            return err
+        }
+        return onSound(int(SoundID))
+    },
 }
 
-func onChatMsg(m chat.Message, pos byte, uuid uuid.UUID) error {
-	msg := m.String()
-	log.Println("Chat:", msg)
-	if msg == "<prof_pizza_v> run" {
-		c.Inputs = path.Inputs{
-			Yaw:       0,
-			Pitch:     0,
-			ThrottleX: 1,
-			ThrottleZ: 0,
-			Jump:      false,
-		}
-		log.Println("starting to run")
-	}
+func UseItem(hand int32) error {
+    return c.Conn.WritePacket(pk.Marshal(
+        packetid.ServerboundUseItem,
+        pk.VarInt(hand),
+    ))
+}
 
-	if msg == "<prof_pizza_v> stop" {
-		c.Inputs = path.Inputs{
-			Yaw:       0,
-			Pitch:     0,
-			ThrottleX: 0,
-			ThrottleZ: 0,
-			Jump:      false,
-		}
-		log.Println("stopping all actions")
-	}
+//goland:noinspection SpellCheckingInspection
+func onSound(id int) error {
+    if id == 369 {
+        if err := UseItem(0); err != nil { // retrieve
+            return err
+        }
+        log.Println("gra~")
+        time.Sleep(time.Millisecond * 300)
+        if err := UseItem(0); err != nil { // throw
+            return err
+        }
+        watch <- time.Now()
+    }
+    return nil
+}
 
-	if msg == "<prof_pizza_v> tree" {
-		findTree()
-		chopTree()
-	}
+func onSystemChat(c chat.Message, overlay bool) error {
+    log.Printf("System Chat: %v, Overlay: %v", c, overlay)
+    return nil
+}
 
-	return nil
+func onPlayerChat(c chat.Message, b bool) error {
+    log.Println("Player Chat:", c, b)
+    return nil
+}
+
+func onDisguisedChat(c chat.Message) error {
+    log.Println("Disguised Chat:", c)
+    return nil
 }
 
 func onDisconnect(c chat.Message) error {
-	log.Println("Disconnect:", c)
-	return nil
+    log.Println("Disconnect:", c)
+    return nil
 }
 
 func watchDog() {
-	//to := time.NewTimer(time.Second * timeout)
-	//for {
-	//	select {
-	//	case <-watch:
-	//	case <-to.C:
-	//		log.Println("rethrow")
-	//		if err := c.UseItem(0); err != nil {
-	//			panic(err)
-	//		}
-	//	}
-	//	to.Reset(time.Second * timeout)
-	//}
-}
-
-func euclidean(x1, y1, z1, x2, y2, z2 float64) float64 {
-	return math.Sqrt(math.Pow(x2-x1, 2) + math.Pow(y2-y1, 2) + math.Pow(z2-z1, 2))
-}
-
-// todo should chop down the whole tree
-// needs the trees position and height
-func chopTree() {}
-
-// get players current position and walk to the given coords
-func walk(x, y, z float64) {
-
+    to := time.NewTimer(time.Second * timeout)
+    for {
+        select {
+        case <-watch:
+        case <-to.C:
+            log.Println("rethrow")
+            if err := UseItem(0); err != nil {
+                panic(err)
+            }
+        }
+        to.Reset(time.Second * timeout)
+    }
 }
